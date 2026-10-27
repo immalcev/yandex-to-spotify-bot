@@ -884,6 +884,33 @@ async def main():
             print(f"⚠️ Ошибка соединения с Telegram: {e}. Переподключение...")
             await asyncio.sleep(3)
 
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Веб-сервер запущен на порту {port}")
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    # Запускаем мини-сервер для Render, чтобы он видел открытый порт
+    asyncio.create_task(start_web_server())
+    
+    print("🚀 Бот запущен! Ожидание сообщений...")
+    
+    while True:
+        try:
+            await dp.start_polling(bot, handle_as_tasks=False)
+        except Exception as e:
+            print(f"⚠️ Ошибка соединения с Telegram: {e}. Переподключение...")
+            await asyncio.sleep(3)
+
 if __name__ == '__main__':
     try:
         asyncio.run(main())
