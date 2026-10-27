@@ -26,7 +26,6 @@ BOT_USERNAME = '@yandex_to_spotify_transfer_bot'
 DB_FILE = 'users_db.json'
 PAGE_SIZE = 10
 
-SPOTIFY_REDIRECT_URI = 'https://t.me/yandex_to_spotify_transfer_bot'
 YANDEX_AUTH_URL = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d"
 
 bot = Bot(token=API_TOKEN)
@@ -35,11 +34,9 @@ dp = Dispatcher(storage=storage)
 
 USER_SESSIONS = {}
 TRANSFER_CANCEL_FLAGS = {}
-WORKING_ADD_METHOD = None
 
 class Form(StatesGroup):
     waiting_for_yandex_token = State()
-    waiting_for_spotify_code = State()
 
 async def safe_delete(message: types.Message):
     try:
@@ -67,18 +64,16 @@ def get_user_data(user_id: int) -> dict:
     db = load_db()
     data = db.get(str(user_id))
     if isinstance(data, str):
-        return {"yandex_token": data, "spotify_token": None, "spotify_refresh": None, "track_ids": []}
+        return {"yandex_token": data, "track_ids": []}
     return data or {}
 
-def save_user_data(user_id: int, yandex_token: str = None, spotify_token: str = None, spotify_refresh: str = None, track_ids: list = None):
+def save_user_data(user_id: int, yandex_token: str = None, track_ids: list = None):
     db = load_db()
     uid_str = str(user_id)
     current = get_user_data(user_id)
     
     db[uid_str] = {
         "yandex_token": yandex_token if yandex_token is not None else current.get("yandex_token"),
-        "spotify_token": spotify_token if spotify_token is not None else current.get("spotify_token"),
-        "spotify_refresh": spotify_refresh if spotify_refresh is not None else current.get("spotify_refresh"),
         "track_ids": list(dict.fromkeys(track_ids)) if track_ids is not None else current.get("track_ids", [])
     }
     save_db(db)
@@ -151,55 +146,22 @@ def fetch_yandex_tracks(token: str, known_ids: list = None, only_new: bool = Fal
     except Exception as e:
         return None, None, f"NETWORK_ERROR: {e}"
 
-def exchange_spotify_code(code: str, redirect_uri: str = SPOTIFY_REDIRECT_URI):
+# Получаем токен разработчика (Client Credentials) для работы с мастер-аккаунтом
+def get_master_spotify_token():
     url = "https://accounts.spotify.com/api/token"
-    payload = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri
-    }
-    auth = (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
-    response = requests.post(url, data=payload, auth=auth)
-    if response.status_code == 200:
-        data = response.json()
-        return data.get("access_token"), data.get("refresh_token")
-    return None, None
-
-def refresh_spotify_access_token(refresh_token: str):
-    url = "https://accounts.spotify.com/api/token"
-    payload = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token
-    }
+    payload = {"grant_type": "client_credentials"}
     auth = (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
     response = requests.post(url, data=payload, auth=auth)
     if response.status_code == 200:
         return response.json().get("access_token")
     return None
 
-def get_valid_spotify_token(user_id: int):
-    user_data = get_user_data(user_id)
-    token = user_data.get("spotify_token")
-    refresh_token = user_data.get("spotify_refresh")
-    
-    if not token:
-        return None
-        
-    headers = {"Authorization": f"Bearer {token}"}
-    test_resp = requests.get("https://api.spotify.com/v1/me", headers=headers)
-    
-    if test_resp.status_code == 200:
-        return token
-        
-    if refresh_token:
-        new_token = refresh_spotify_access_token(refresh_token)
-        if new_token:
-            save_user_data(user_id, spotify_token=new_token)
-            return new_token
-            
-    return None
+# Внимание: для создания плейлиста от имени твоего мастер-аккаунта через API нужен User Token, 
+# либо мы можем создавать публичный плейлист или искать треки. 
+# Потребуется указать твой User ID в Spotify (spotify_user_id) в переменных окружения или зашить сюда:
+SPOTIFY_MASTER_USER_ID = os.getenv("SPOTIFY_MASTER_USER_ID", "")
 
-def create_spotify_playlist(spotify_token: str):
+def create_master_spotify_playlist(spotify_token: str):
     headers = {
         "Authorization": f"Bearer {spotify_token}",
         "Content-Type": "application/json"
@@ -207,8 +169,9 @@ def create_spotify_playlist(spotify_token: str):
     date_str = datetime.now().strftime("%d.%m.%y")
     playlist_name = f"Яндекс.Музыка {date_str}"
     
+    # Создаем плейлист на мастер-аккаунте
     playlist_resp = requests.post(
-        "https://api.spotify.com/v1/me/playlists",
+        f"https://api.spotify.com/v1/users/{SPOTIFY_MASTER_USER_ID}/playlists",
         headers=headers,
         json={
             "name": playlist_name,
@@ -249,57 +212,25 @@ async def fast_search_track(http_session: aiohttp.ClientSession, sem: asyncio.Se
                 await asyncio.sleep(0.2)
     return None, None
 
-def add_uris_to_spotify(spotify_token: str, playlist_id: str, uris: list, ids: list):
-    global WORKING_ADD_METHOD
+def add_uris_to_spotify(spotify_token: str, playlist_id: str, uris: list):
     if not uris:
-        return True, "playlist", None
+        return True, None
         
     headers = {
         "Authorization": f"Bearer {spotify_token}",
         "Content-Type": "application/json"
     }
     
-    methods_to_try = [WORKING_ADD_METHOD] if WORKING_ADD_METHOD else ["items", "tracks", "liked_songs"]
-    
-    for method in methods_to_try:
-        if method == "items":
-            r = requests.post(
-                f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
-                headers=headers,
-                json={"uris": uris},
-                timeout=15
-            )
-            if r.status_code in (200, 201):
-                WORKING_ADD_METHOD = "items"
-                return True, "playlist", None
-                
-        elif method == "tracks":
-            r = requests.post(
-                f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
-                headers=headers,
-                json={"uris": uris},
-                timeout=15
-            )
-            if r.status_code in (200, 201):
-                WORKING_ADD_METHOD = "tracks"
-                return True, "playlist", None
-                
-        elif method == "liked_songs":
-            r = requests.put(
-                "https://api.spotify.com/v1/me/tracks",
-                headers=headers,
-                json={"ids": ids[:50]},
-                timeout=15
-            )
-            if r.status_code in (200, 201, 204):
-                WORKING_ADD_METHOD = "liked_songs"
-                return True, "liked_songs", None
+    r = requests.post(
+        f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+        headers=headers,
+        json={"uris": uris},
+        timeout=15
+    )
+    if r.status_code in (200, 201):
+        return True, None
 
-    if WORKING_ADD_METHOD is not None:
-        WORKING_ADD_METHOD = None
-        return add_uris_to_spotify(spotify_token, playlist_id, uris, ids)
-
-    return False, None, "Не удалось добавить треки в Spotify (ошибка доступа 403)."
+    return False, "Не удалось добавить треки в плейлист Spotify."
 
 def get_yandex_auth_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -434,31 +365,34 @@ def build_tracks_view(user_id: int, page: int = 0, select_mode: bool = False):
             InlineKeyboardButton(text="🔙 К обычному списку", callback_data=f"mode_view_{page}")
         ])
 
-    kb.append([InlineKeyboardButton(text="🟢 Отправить выбранное в Spotify", callback_data="transfer_to_spotify_direct")])
+    kb.append([InlineKeyboardButton(text="🟢 Сгенерировать плейлист в Spotify", callback_data="transfer_to_spotify_direct")])
     kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
 
     return text, InlineKeyboardMarkup(inline_keyboard=kb)
 
-async def run_spotify_transfer_task(message: types.Message, user_id: int, valid_spotify_token: str, tracks_to_transfer: list):
+async def run_spotify_transfer_task(message: types.Message, user_id: int, tracks_to_transfer: list):
     total_to_transfer = len(tracks_to_transfer)
     TRANSFER_CANCEL_FLAGS[user_id] = False
     
     wait_msg = await message.answer(
-        f"⚡ Создаю плейлист в Spotify для {total_to_transfer} треков...",
+        f"⚡ Получаю доступ к Spotify и создаю плейлист...",
         reply_markup=get_cancel_keyboard()
     )
     
-    playlist_id, playlist_url, err = await asyncio.to_thread(create_spotify_playlist, valid_spotify_token)
+    spotify_token = await asyncio.to_thread(get_master_spotify_token)
+    if not spotify_token:
+        await wait_msg.edit_text("❌ Ошибка авторизации в Spotify со стороны бота.")
+        return
+
+    playlist_id, playlist_url, err = await asyncio.to_thread(create_master_spotify_playlist, spotify_token)
     if err:
-        await wait_msg.edit_text(f"❌ Ошибка создания плейлиста: `{err}`", parse_mode="Markdown")
+        await wait_msg.edit_text(f"❌ Ошибка создания плейлиста. Убедись, что указан `SPOTIFY_MASTER_USER_ID`: `{err}`", parse_mode="Markdown")
         return
 
     transferred_tracks = []
     not_transferred_tracks = []
     pending_uris = []
-    pending_ids = []
     pending_track_objs = []
-    target_dest = "playlist"
 
     sem = asyncio.Semaphore(3)
     step_size = 10
@@ -472,28 +406,25 @@ async def run_spotify_transfer_task(message: types.Message, user_id: int, valid_
                 break
 
             chunk = tracks_to_transfer[start_i:start_i + step_size]
-            tasks = [fast_search_track(http_session, sem, valid_spotify_token, t) for t in chunk]
+            tasks = [fast_search_track(http_session, sem, spotify_token, t) for t in chunk]
             results = await asyncio.gather(*tasks)
 
             for t_obj, (uri, tid) in zip(chunk, results):
-                if uri and tid:
+                if uri:
                     pending_uris.append(uri)
-                    pending_ids.append(tid)
                     pending_track_objs.append(t_obj)
                 else:
                     not_transferred_tracks.append(t_obj)
 
             if len(pending_uris) >= 50 or (start_i + step_size >= total_to_transfer and pending_uris):
-                ok, dest_type, add_err = await asyncio.to_thread(
-                    add_uris_to_spotify, valid_spotify_token, playlist_id, pending_uris, pending_ids
+                ok, add_err = await asyncio.to_thread(
+                    add_uris_to_spotify, spotify_token, playlist_id, pending_uris
                 )
                 if not ok:
                     await wait_msg.edit_text(f"⚠️ Ошибка при добавлении треков: `{add_err}`", parse_mode="Markdown")
                     return
-                target_dest = dest_type
                 transferred_tracks.extend(pending_track_objs)
                 pending_uris.clear()
-                pending_ids.clear()
                 pending_track_objs.clear()
 
             processed = min(start_i + step_size, total_to_transfer)
@@ -503,7 +434,7 @@ async def run_spotify_transfer_task(message: types.Message, user_id: int, valid_
 
             try:
                 await wait_msg.edit_text(
-                    f"⏳ **Перенос треков в Spotify... ({percent}%)**\n\n"
+                    f"⏳ **Собираю плейлист для Spotify... ({percent}%)**\n\n"
                     f"🔎 Проверено: **{processed} из {total_to_transfer}**\n"
                     f"✅ Найдено и добавлено: **{current_added}**\n"
                     f"🎵 Сейчас: *{last_t['artist']} — {last_t['track']}*",
@@ -514,11 +445,10 @@ async def run_spotify_transfer_task(message: types.Message, user_id: int, valid_
                 pass
 
     if pending_uris:
-        ok, dest_type, _ = await asyncio.to_thread(
-            add_uris_to_spotify, valid_spotify_token, playlist_id, pending_uris, pending_ids
+        ok, _ = await asyncio.to_thread(
+            add_uris_to_spotify, spotify_token, playlist_id, pending_uris
         )
         if ok:
-            target_dest = dest_type
             transferred_tracks.extend(pending_track_objs)
         else:
             not_transferred_tracks.extend(pending_track_objs)
@@ -534,20 +464,17 @@ async def run_spotify_transfer_task(message: types.Message, user_id: int, valid_
 
     await safe_delete(wait_msg)
 
-    if target_dest == "liked_songs":
-        dest_text = "💜 Сохранено в твои **«Любимые треки» (Liked Songs)** в Spotify!"
-    else:
-        dest_text = f"🎵 Плейлист: `Яндекс.Музыка {datetime.now().strftime('%d.%m.%y')}`\n🔗 [Открыть плейлист в Spotify]({playlist_url})"
+    dest_text = f"🎵 Плейлист готов!\n🔗 [Открыть плейлист в Spotify]({playlist_url})"
 
     tr_cnt = len(transferred_tracks)
     untr_cnt = len(not_transferred_tracks)
 
-    status_header = "🛑 **Перенос остановлен!**" if cancelled else "✅ **Готово! Перенос успешно завершен!**"
+    status_header = "🛑 **Перенос остановлен!**" if cancelled else "✅ **Готово! Плейлист успешно создан!**"
 
     await message.answer(
         f"{status_header}\n\n"
-        f"✅ Перенесено песен: **{tr_cnt}**\n"
-        f"❌ Не перенесено: **{untr_cnt}**\n\n"
+        f"✅ Добавлено песен: **{tr_cnt}**\n"
+        f"❌ Не найдено: **{untr_cnt}**\n\n"
         f"{dest_text}",
         parse_mode="Markdown",
         reply_markup=get_transfer_summary_keyboard(tr_cnt, untr_cnt)
@@ -569,7 +496,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
     else:
         await message.answer(
-            "👋 **Привет! Я помогу быстро перенести лайки из Яндекс.Музыки в Spotify.**\n\n"
+            "👋 **Привет! Я помогу быстро перенести треки из Яндекс.Музыки в плейлист Spotify.**\n\n"
             "1. Нажми кнопку **🔑 Войти в Яндекс.Музыку** ниже.\n"
             "2. После входа скопируй ссылку из адресной строки браузера и отправь её сюда в чат!",
             parse_mode="Markdown",
@@ -685,11 +612,7 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
         if not untr:
             await callback.answer("Нет песен для повторного переноса!", show_alert=True)
             return
-        valid_spotify_token = await asyncio.to_thread(get_valid_spotify_token, user_id)
-        if not valid_spotify_token:
-            await callback.message.answer("⚠️ Токен Spotify устарел, нажми /start.")
-            return
-        asyncio.create_task(run_spotify_transfer_task(callback.message, user_id, valid_spotify_token, list(untr)))
+        asyncio.create_task(run_spotify_transfer_task(callback.message, user_id, list(untr)))
         return
 
     if data == "main_menu":
@@ -729,33 +652,10 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
 
     if data in ("start_spotify_transfer", "transfer_to_spotify_direct"):
         await callback.answer()
-        valid_spotify_token = await asyncio.to_thread(get_valid_spotify_token, user_id)
-        
-        if not valid_spotify_token:
-            scopes = "playlist-modify-public%20playlist-modify-private%20user-read-private%20user-library-modify"
-            spotify_auth_url = (
-                f"https://accounts.spotify.com/authorize"
-                f"?client_id={SPOTIFY_CLIENT_ID}"
-                f"&response_type=code"
-                f"&redirect_uri={SPOTIFY_REDIRECT_URI}"
-                f"&scope={scopes}"
-                f"&state={user_id}"
-            )
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🟢 Войти в Spotify", url=spotify_auth_url)]
-            ])
-            await callback.message.answer(
-                "🟢 **Авторизация в Spotify**\n\n"
-                "Нажми на кнопку ниже и подтверди вход в браузере:",
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
-            await state.set_state(Form.waiting_for_spotify_code)
-            return
         
         session = USER_SESSIONS.get(user_id)
         if not session or not session.get("tracks"):
-            wait_ses = await callback.message.answer("🔄 Подтягиваю треки из Яндекс.Музыки для переноса...")
+            wait_ses = await callback.message.answer("🔄 Подтягиваю треки из Яндекс.Музыки...")
             user_data = get_user_data(user_id)
             token = user_data.get("yandex_token")
             known_ids = user_data.get("track_ids", [])
@@ -778,7 +678,7 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
             USER_SESSIONS[user_id] = session
 
         tracks_to_transfer = [session["tracks"][i] for i in sorted(session["selected"])] if session.get("selected") else session["tracks"]
-        asyncio.create_task(run_spotify_transfer_task(callback.message, user_id, valid_spotify_token, tracks_to_transfer))
+        asyncio.create_task(run_spotify_transfer_task(callback.message, user_id, tracks_to_transfer))
         return
 
     session = USER_SESSIONS.get(user_id)
@@ -794,7 +694,6 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
         return
 
     if data.startswith("mode_sel_"):
-        xml_data = data.split("_")
         await callback.answer()
         text, markup = build_tracks_view(user_id, page=int(data.split("_")[-1]), select_mode=True)
         await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
@@ -841,49 +740,6 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Файл отправлен!")
         return
 
-@dp.message(Form.waiting_for_spotify_code)
-async def process_spotify_auth(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    match = re.search(r'code=([^&]+)', text)
-    if not match:
-        await message.answer("❌ Не удалось найти код авторизации в ссылке. Попробуй еще раз.")
-        return
-
-    code = match.group(1)
-    wait_msg = await message.answer("🔄 Подключаю Spotify...")
-    
-    spotify_token, spotify_refresh = await asyncio.to_thread(exchange_spotify_code, code, SPOTIFY_REDIRECT_URI)
-    if not spotify_token:
-        spotify_token, spotify_refresh = await asyncio.to_thread(
-            exchange_spotify_code, code, 'https://t.me/yandex_to_spotify_transfer_bot'
-        )
-        
-    if not spotify_token:
-        await wait_msg.edit_text("❌ Ошибка подключения Spotify. Нажми кнопку переноса заново.")
-        await state.clear()
-        return
-
-    save_user_data(message.from_user.id, spotify_token=spotify_token, spotify_refresh=spotify_refresh)
-    await state.clear()
-    
-    await wait_msg.edit_text(
-        "✅ **Spotify успешно подключен!**\n\n"
-        "Нажми кнопку **🟢 Перенести в Spotify** ниже, чтобы запустить перенос треков!", 
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(True)
-    )
-
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 Бот запущен! Ожидание сообщений...")
-    
-    while True:
-        try:
-            await dp.start_polling(bot, handle_as_tasks=False)
-        except Exception as e:
-            print(f"⚠️ Ошибка соединения с Telegram: {e}. Переподключение...")
-            await asyncio.sleep(3)
-
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -899,7 +755,6 @@ async def start_web_server():
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаем мини-сервер для Render, чтобы он видел открытый порт
     asyncio.create_task(start_web_server())
     
     print("🚀 Бот запущен! Ожидание сообщений...")
